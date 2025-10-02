@@ -1,0 +1,302 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# ---- CONFIGURE THESE BEFORE RUNNING ----
+REPO_NAME="trustlike-wallet"                # change if you want another name
+VISIBILITY="public"                         # or "private"
+GIT_USER_NAME="${GIT_USER_NAME:-$(git config user.name)}"
+GIT_USER_EMAIL="${GIT_USER_EMAIL:-$(git config user.email)}"
+INFURA_DEMO_KEY="84842078b09946638c03157f83405213"
+BTC_API="https://api.blockcypher.com/v1/btc/test3"
+# ----------------------------------------
+
+# Check prerequisites
+command -v gh >/dev/null 2>&1 || { echo "Install GitHub CLI (gh) and login: https://cli.github.com/"; exit 1; }
+command -v git >/dev/null 2>&1 || { echo "Install git"; exit 1; }
+command -v node >/dev/null 2>&1 || { echo "Install Node.js (v16+ or v18 recommended)"; exit 1; }
+command -v yarn >/dev/null 2>&1 || { echo "Install yarn (npm i -g yarn) or edit script to use npm"; exit 1; }
+
+# Create repo on GitHub under your account (gh must be logged in)
+echo "Creating GitHub repo: $REPO_NAME (visibility: $VISIBILITY)"
+gh repo create "$REPO_NAME" --"$VISIBILITY" --confirm || { echo "gh repo create failed"; exit 1; }
+
+# Clone it locally
+git clone "https://github.com/$(gh api user --jq .login)/$REPO_NAME.git"
+cd "$REPO_NAME"
+
+# Initialize project files (Vite + minimal setup)
+cat > package.json <<'JSON'
+{
+  "name": "trustlike-wallet-web",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {
+    "react": "^18.2.0",
+    "react-dom": "^18.2.0",
+    "ethers": "^6.7.0",
+    "bip39": "^3.0.4",
+    "bitcoinjs-lib": "^6.1.0",
+    "axios": "^1.6.0",
+    "html5-qrcode": "^2.3.12"
+  },
+  "scripts": {
+    "start": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "predeploy": "yarn build",
+    "deploy": "gh-pages -d dist"
+  },
+  "devDependencies": {
+    "typescript": "^5.2.0",
+    "vite": "^4.5.0",
+    "@vitejs/plugin-react": "^4.0.0",
+    "gh-pages": "^5.0.0"
+  }
+}
+JSON
+
+cat > tsconfig.json <<'JSON'
+{
+  "compilerOptions": {
+    "target": "ESNext",
+    "module": "ESNext",
+    "jsx": "react-jsx",
+    "strict": true,
+    "moduleResolution": "node",
+    "esModuleInterop": true,
+    "skipLibCheck": true
+  },
+  "include": ["src"]
+}
+JSON
+
+cat > vite.config.ts <<'TS'
+import { defineConfig } from 'vite'
+import react from '@vitejs/plugin-react'
+export default defineConfig({
+  plugins: [react()],
+  server: { port: 3000 }
+})
+TS
+
+mkdir -p public src src/components src/services
+
+cat > public/index.html <<'HTML'
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>TrustLike Wallet Web</title>
+<link rel="manifest" href="/manifest.json" />
+<meta name="theme-color" content="#4f46e5" />
+</head>
+<body>
+<div id="root"></div>
+</body>
+</html>
+HTML
+
+cat > public/manifest.json <<'JSON'
+{
+  "name": "TrustLike Wallet Web",
+  "short_name": "TL Wallet",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#1e1e1e",
+  "theme_color": "#4f46e5",
+  "icons": [
+    {"src": "/icon-192.png", "sizes": "192x192", "type": "image/png"},
+    {"src": "/icon-512.png", "sizes": "512x512", "type": "image/png"}
+  ]
+}
+JSON
+
+# create placeholder icons (empty files) - replace with real icons later
+touch public/icon-192.png public/icon-512.png
+
+cat > src/index.tsx <<'TSX'
+import React from 'react';
+import ReactDOM from 'react-dom/client';
+import App from './App';
+if ('serviceWorker' in navigator) {
+  window.addEventListener('load', () => {
+    navigator.serviceWorker.register('/service-worker.js')
+      .then(reg => console.log('Service worker registered', reg))
+      .catch(err => console.error('SW failed:', err));
+  });
+}
+let deferredPrompt:any;
+window.addEventListener('beforeinstallprompt', (e:any) => {
+  e.preventDefault();
+  deferredPrompt = e;
+  const installBtn = document.createElement('button');
+  installBtn.innerText = 'Install Wallet';
+  installBtn.onclick = async () => {
+    deferredPrompt.prompt();
+    const choice = await deferredPrompt.userChoice;
+    console.log(choice);
+  };
+  document.body.appendChild(installBtn);
+});
+ReactDOM.createRoot(document.getElementById('root')!).render(
+  <React.StrictMode><App /></React.StrictMode>
+);
+TSX
+
+cat > src/App.tsx <<'TSX'
+import React, { useState } from 'react';
+import Home from './components/Home';
+import Send from './components/Send';
+export default function App() {
+  const [screen, setScreen] = useState<'home'|'send'>('home');
+  const [ethWallet, setEthWallet] = useState<any>(null);
+  const [btcWallet, setBtcWallet] = useState<any>(null);
+  return (
+    <div style={{maxWidth:600, margin:'0 auto', padding:20}}>
+      {screen==='home' && <Home setScreen={setScreen} ethWallet={ethWallet} setEthWallet={setEthWallet} btcWallet={btcWallet} setBtcWallet={setBtcWallet}/>}
+      {screen==='send' && <Send setScreen={setScreen} ethWallet={ethWallet} btcWallet={btcWallet}/>}
+    </div>
+  );
+}
+TSX
+
+cat > src/service-worker.ts <<'TS'
+const CACHE_NAME = 'trustlike-wallet-cache-v1';
+const urlsToCache = ['/', '/index.html'];
+self.addEventListener('install', (event:any) => {
+  event.waitUntil(caches.open(CACHE_NAME).then(cache => cache.addAll(urlsToCache)));
+});
+self.addEventListener('fetch', (event:any) => {
+  event.respondWith(caches.match(event.request).then(resp=>resp || fetch(event.request)));
+});
+TS
+
+cat > src/services/wallet.ts <<'TS'
+import { ethers } from 'ethers';
+import * as bip39 from 'bip39';
+import * as bitcoin from 'bitcoinjs-lib';
+import axios from 'axios';
+const BITCOIN_TESTNET = bitcoin.networks.testnet;
+export function generateETHWallet(){ const mnemonic = bip39.generateMnemonic(); return ethers.Wallet.fromMnemonic(mnemonic);}
+export async function sendETH(wallet:any, toAddress:string, amount:string){ const provider=new ethers.JsonRpcProvider(`https://goerli.infura.io/v3/${import.meta.env.VITE_INFURA_PROJECT_ID}`); const connectedWallet=wallet.connect(provider); const tx=await connectedWallet.sendTransaction({to:toAddress,value:ethers.parseEther(amount)}); await tx.wait(); return tx.hash;}
+export function generateBTCWallet(){ const keyPair = bitcoin.ECPair.makeRandom({ network:BITCOIN_TESTNET }); const {address}=bitcoin.payments.p2pkh({pubkey:keyPair.publicKey,network:BITCOIN_TESTNET}); return {keyPair,address};}
+export async function getBTCBalance(address:string){try{const res=await axios.get(`${import.meta.env.VITE_BTC_API}/addrs/${address}/balance`); return res.data.final_balance;}catch(e:any){console.error(e); return 0;}}
+export async function sendBTC(keyPair:any,toAddress:string,amountSats:number){try{const res=await axios.get(`${import.meta.env.VITE_BTC_API}/addrs/${keyPair.publicKey.toString('hex')}?unspentOnly=true`); const utxos=res.data.txrefs; if(!utxos||utxos.length===0)throw new Error("No UTXOs"); const txb=new bitcoin.TransactionBuilder(BITCOIN_TESTNET); let inputSum=0; for(const utxo of utxos){txb.addInput(utxo.tx_hash,utxo.tx_output_n); inputSum+=utxo.value; if(inputSum>=amountSats+1000) break;} if(inputSum<amountSats+1000)throw new Error("Insufficient balance"); txb.addOutput(toAddress,amountSats); const change=inputSum-amountSats-1000; if(change>0)txb.addOutput(generateBTCWallet().address,change); utxos.slice(0,txb.__inputs.length).forEach((utxo,i)=>{txb.sign(i,keyPair)}); const rawTx=txb.build().toHex(); const broadcast=await axios.post('https://api.blockcypher.com/v1/btc/test3/txs/push',{tx:rawTx}); return broadcast.data.tx.hash;}catch(e:any){console.error(e); throw new Error(e.message);}
+}
+TS
+
+cat > src/components/Home.tsx <<'TSX'
+import React, { useState } from 'react';
+import { generateETHWallet, generateBTCWallet, getBTCBalance } from '../services/wallet';
+export default function Home({ setScreen, ethWallet, setEthWallet, btcWallet, setBtcWallet }: any) {
+  const [btcBalance, setBtcBalance] = useState<number>(0);
+  const handleGenerate = async () => {
+    const eth = generateETHWallet();
+    setEthWallet(eth);
+    const btc = generateBTCWallet();
+    setBtcWallet(btc);
+    const balance = await getBTCBalance(btc.address);
+    setBtcBalance(balance);
+  };
+  return (
+    <div>
+      <h1>TrustLike Wallet Web</h1>
+      {ethWallet ? (
+        <div>
+          <p><strong>ETH Address:</strong> {ethWallet.address}</p>
+          <p><strong>BTC Address:</strong> {btcWallet.address}</p>
+          <p><strong>BTC Balance:</strong> {btcBalance} sats</p>
+          <p>Need test BTC? Visit <a href="https://testnet-faucet.mempool.co/" target="_blank">BTC Faucet</a></p>
+          <button onClick={() => setScreen('send')}>Send Crypto</button>
+        </div>
+      ) : (
+        <button onClick={handleGenerate}>Generate Wallets</button>
+      )}
+    </div>
+  );
+}
+TSX
+
+cat > src/components/Send.tsx <<'TSX'
+import React, { useState } from 'react';
+import { sendETH, sendBTC } from '../services/wallet';
+import { Html5QrcodeScanner } from 'html5-qrcode';
+export default function Send({ setScreen, ethWallet, btcWallet }: any) {
+  const [address, setAddress] = useState('');
+  const [amount, setAmount] = useState('');
+  const [currency, setCurrency] = useState<'ETH' | 'BTC'>('ETH');
+  const handleSend = async () => {
+    try {
+      let txHash;
+      if (currency === 'ETH') {
+        txHash = await sendETH(ethWallet, address, amount);
+      } else {
+        txHash = await sendBTC(btcWallet.keyPair, address, parseInt(amount));
+      }
+      alert(`${currency} Transaction sent! Hash: ${txHash}`);
+    } catch (e: any) {
+      alert('Error: ' + e.message);
+    }
+  };
+  const startScanner = () => {
+    const scanner = new Html5QrcodeScanner("reader", { fps: 10, qrbox: 250 });
+    scanner.render(
+      (decodedText: string) => {
+        setAddress(decodedText);
+        scanner.clear();
+      },
+      (errorMessage: any) => { }
+    );
+  };
+  return (
+    <div>
+      <h2>Send Crypto</h2>
+      <select value={currency} onChange={e => setCurrency(e.target.value as 'ETH' | 'BTC')}>
+        <option value="ETH">ETH</option>
+        <option value="BTC">BTC</option>
+      </select>
+      <input placeholder="Recipient Address" value={address} onChange={e => setAddress(e.target.value)} style={{ width: '100%' }} />
+      <input placeholder="Amount" value={amount} onChange={e => setAmount(e.target.value)} style={{ width: '100%' }} />
+      <button onClick={handleSend}>Send</button>
+      <button onClick={() => setScreen('home')}>Back</button>
+      <div id="reader" style={{ width: '100%', marginTop: 20 }}></div>
+      <button onClick={startScanner}>Scan QR Code</button>
+    </div>
+  );
+}
+TSX
+
+# create example .env (local only - don't commit)
+cat > .env.example <<'ENV'
+VITE_INFURA_PROJECT_ID='${INFURA_DEMO_KEY}'
+VITE_BTC_API='${BTC_API}'
+ENV
+
+# Git commit & push
+yarn install
+git add .
+git commit -m "TrustLike Wallet starter: web PWA + BTC/ETH testnet"
+git branch -M main
+git push -u origin main
+
+echo "Repository created and pushed: https://github.com/$(gh api user --jq .login)/$REPO_NAME"
+
+# OPTIONAL: prompt to set secrets
+echo ""
+read -p "Would you like to set GitHub Actions secrets now? (y/N) " SET_SECRETS
+if [[ "${SET_SECRETS:-N}" =~ ^[Yy]$ ]]; then
+  read -p "Enter EAS_TOKEN (leave blank to skip): " EAS_TOKEN
+  if [[ -n "$EAS_TOKEN" ]]; then
+    gh secret set EAS_TOKEN --body "$EAS_TOKEN" --repo "$(gh api user --jq .login)/$REPO_NAME"
+    echo "EAS_TOKEN secret set."
+  fi
+  read -p "Enter VITE_INFURA_PROJECT_ID (or press Enter to use demo): " INFURA_KEY
+  if [[ -n "$INFURA_KEY" ]]; then
+    gh secret set VITE_INFURA_PROJECT_ID --body "$INFURA_KEY" --repo "$(gh api user --jq .login)/$REPO_NAME"
+    echo "VITE_INFURA_PROJECT_ID secret set."
+  fi
+  echo "If you need to add Play Store credentials or other JSON secrets, add them manually in the repo Settings -> Secrets."
+fi
+
+echo "Done. Visit https://github.com/$(gh api user --jq .login)/$REPO_NAME to see your new project."
